@@ -27,6 +27,7 @@ public class MyAgent : AgentApplication
     private readonly ILogger<MyAgent> _logger;
     private readonly IMcpToolRegistrationService _toolService;
     private readonly ComputerUseOrchestrator _orchestrator;
+    private readonly Holo3CuaOrchestrator? _holo3Orchestrator;
     private readonly string? _mcpServerUrl;
 
     private readonly string? AgenticAuthHandlerName;
@@ -64,9 +65,11 @@ public class MyAgent : AgentApplication
         IExporterTokenCache<AgenticTokenStruct> agentTokenCache,
         IMcpToolRegistrationService toolService,
         ComputerUseOrchestrator orchestrator,
-        ILogger<MyAgent> logger) : base(options)
+        ILogger<MyAgent> logger,
+        Holo3CuaOrchestrator? holo3Orchestrator = null) : base(options)
     {
         _agentTokenCache = agentTokenCache;
+        _holo3Orchestrator = holo3Orchestrator;
         _logger = logger;
         _toolService = toolService;
         _orchestrator = orchestrator;
@@ -222,16 +225,40 @@ public class MyAgent : AgentApplication
                         }
 
                         // Run the CUA loop — session is managed per conversation
-                        var response = await _orchestrator.RunAsync(
-                            conversationId,
-                            userText,
-                            w365Tools,
-                            mcpClient: mcpClient,
-                            graphAccessToken: graphToken,
-                            onStatusUpdate: status => turnContext.StreamingResponse.QueueInformativeUpdateAsync(status).ConfigureAwait(false),
-                            onFolderLinkReady: async url => await turnContext.SendActivityAsync(
-                                MessageFactory.Text($"📸 Screenshots for this session: [View folder]({url})"), cancellationToken),
-                            cancellationToken: cancellationToken);
+                        string response;
+                        if (_holo3Orchestrator != null)
+                        {
+                            // Holo3 path: start session via main orchestrator, then delegate CUA loop to Holo3
+                            await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Starting W365 computing session...").ConfigureAwait(false);
+                            var sessionId = await ComputerUseOrchestrator.StartSessionAsync(w365Tools, _logger, cancellationToken);
+                            _logger.LogInformation("W365 session started for Holo3: {SessionId}", sessionId);
+                            try
+                            {
+                                response = await _holo3Orchestrator.RunAsync(
+                                    userText,
+                                    sessionId,
+                                    w365Tools,
+                                    onStatusUpdate: status => turnContext.StreamingResponse.QueueInformativeUpdateAsync(status).ConfigureAwait(false),
+                                    cancellationToken: cancellationToken);
+                            }
+                            finally
+                            {
+                                await ComputerUseOrchestrator.EndSessionAsync(w365Tools, _logger, sessionId, cancellationToken);
+                            }
+                        }
+                        else
+                        {
+                            response = await _orchestrator.RunAsync(
+                                conversationId,
+                                userText,
+                                w365Tools,
+                                mcpClient: mcpClient,
+                                graphAccessToken: graphToken,
+                                onStatusUpdate: status => turnContext.StreamingResponse.QueueInformativeUpdateAsync(status).ConfigureAwait(false),
+                                onFolderLinkReady: async url => await turnContext.SendActivityAsync(
+                                    MessageFactory.Text($"📸 Screenshots for this session: [View folder]({url})"), cancellationToken),
+                                cancellationToken: cancellationToken);
+                        }
 
                         // Send the response
                         turnContext.StreamingResponse.QueueTextChunk(response);

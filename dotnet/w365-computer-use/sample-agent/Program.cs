@@ -44,7 +44,12 @@ builder.Services.AddSingleton<IMcpToolServerConfigurationService, McpToolServerC
 
 // Register the model provider based on configuration
 var aiProvider = builder.Configuration["AIServices:Provider"] ?? "AzureOpenAI";
-if (aiProvider.Equals("CustomEndpoint", StringComparison.OrdinalIgnoreCase))
+if (aiProvider.Equals("Holo3", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<Holo3ModelProvider>();
+    builder.Services.AddSingleton<ICuaModelProvider>(sp => sp.GetRequiredService<Holo3ModelProvider>());
+}
+else if (aiProvider.Equals("CustomEndpoint", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<ICuaModelProvider, CustomEndpointProvider>();
 }
@@ -53,8 +58,12 @@ else
     builder.Services.AddSingleton<ICuaModelProvider, AzureOpenAIModelProvider>();
 }
 
-// Register the Computer Use orchestrator
+// Register the Computer Use orchestrators
 builder.Services.AddSingleton<ComputerUseOrchestrator>();
+if (aiProvider.Equals("Holo3", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<Holo3CuaOrchestrator>();
+}
 
 // Add AspNet token validation
 builder.Services.AddAgentAspNetAuthentication(builder.Configuration);
