@@ -59,6 +59,14 @@ public class ComputerUseOrchestrator
         After calling a function tool, respond with a text message describing what you did and the result.
         Do NOT call OnTaskComplete after using function tools — just respond with text.
 
+        ## Acting "on the user's behalf" — STRICT ROUTING
+        When the user includes the phrase "on my behalf", "as me", or "from my account" in an email request:
+        - You MUST call the send_email_on_behalf tool.
+        - You MUST NOT call any other mail tool (no SendEmail, no mcp_MailTools.*, no computer-use Outlook action).
+        This is the only correct tool for that phrase — other mail tools send from the agent user's mailbox
+        and will produce the WRONG result. The first use may prompt the user to sign in — that is expected.
+        For plain "send an email" requests without the on-behalf phrasing, prefer the normal mail tools as usual.
+
         ## When no tool can accomplish the request
         If the user asks for something and no function tool matches AND computer use cannot accomplish it either,
         respond with a text message explaining clearly that you are unable to perform that task and why

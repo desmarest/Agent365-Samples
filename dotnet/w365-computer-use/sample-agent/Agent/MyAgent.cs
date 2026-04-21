@@ -13,6 +13,7 @@ using Microsoft.Agents.Builder.State;
 using Microsoft.Agents.Core;
 using Microsoft.Agents.Core.Models;
 using Microsoft.Extensions.AI;
+using Microsoft.Identity.Abstractions;
 using ModelContextProtocol.Client;
 
 namespace W365ComputerUseSample.Agent;
@@ -27,10 +28,13 @@ public class MyAgent : AgentApplication
     private readonly ILogger<MyAgent> _logger;
     private readonly IMcpToolRegistrationService _toolService;
     private readonly ComputerUseOrchestrator _orchestrator;
+    private readonly IAuthorizationHeaderProvider _authHeaderProvider;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly string[] _mcpServerUrls;
+    private readonly string? _agentIdentityAppId;
+    private readonly string? _userAccessToken;
 
     private readonly string? AgenticAuthHandlerName;
-    private readonly string? OboAuthHandlerName;
 
     /// <summary>
     /// Check if a bearer token is available in the environment for development/testing.
@@ -64,12 +68,18 @@ public class MyAgent : AgentApplication
         IExporterTokenCache<AgenticTokenStruct> agentTokenCache,
         IMcpToolRegistrationService toolService,
         ComputerUseOrchestrator orchestrator,
+        IAuthorizationHeaderProvider authHeaderProvider,
+        IHttpClientFactory httpClientFactory,
         ILogger<MyAgent> logger) : base(options)
     {
         _agentTokenCache = agentTokenCache;
         _logger = logger;
         _toolService = toolService;
         _orchestrator = orchestrator;
+        _authHeaderProvider = authHeaderProvider;
+        _httpClientFactory = httpClientFactory;
+        _agentIdentityAppId = configuration.GetValue<string>("Obo:AgentIdentityAppId");
+        _userAccessToken = configuration.GetValue<string>("Obo:UserAccessToken");
 
         // Support multiple MCP server URLs; fall back to single McpServer:Url for backward compat
         _mcpServerUrls = configuration.GetSection("McpServers").Get<string[]>() ?? [];
@@ -81,22 +91,17 @@ public class MyAgent : AgentApplication
         }
 
         AgenticAuthHandlerName = configuration.GetValue<string>("AgentApplication:AgenticAuthHandlerName");
-        OboAuthHandlerName = configuration.GetValue<string>("AgentApplication:OboAuthHandlerName");
 
         // Greet when members are added
         OnConversationUpdate(ConversationUpdateEvents.MembersAdded, WelcomeMessageAsync);
 
-        // Compute auth handler arrays once
         var agenticHandlers = !string.IsNullOrEmpty(AgenticAuthHandlerName) ? [AgenticAuthHandlerName] : Array.Empty<string>();
-        var oboHandlers = !string.IsNullOrEmpty(OboAuthHandlerName) ? [OboAuthHandlerName] : Array.Empty<string>();
 
-        // Handle install/uninstall
         OnActivity(ActivityTypes.InstallationUpdate, OnInstallationUpdateAsync, isAgenticOnly: true, autoSignInHandlers: agenticHandlers);
         OnActivity(ActivityTypes.InstallationUpdate, OnInstallationUpdateAsync, isAgenticOnly: false);
 
-        // Handle messages — MUST BE AFTER any other message handlers
         OnActivity(ActivityTypes.Message, OnMessageAsync, isAgenticOnly: true, autoSignInHandlers: agenticHandlers);
-        OnActivity(ActivityTypes.Message, OnMessageAsync, isAgenticOnly: false, autoSignInHandlers: oboHandlers);
+        OnActivity(ActivityTypes.Message, OnMessageAsync, isAgenticOnly: false);
     }
 
     protected async Task WelcomeMessageAsync(ITurnContext turnContext, ITurnState turnState, CancellationToken cancellationToken)
@@ -154,17 +159,8 @@ public class MyAgent : AgentApplication
             fromAccount?.Id ?? "(unknown)",
             fromAccount?.AadObjectId ?? "(none)");
 
-        // Select auth handler based on request type
-        string? ObservabilityAuthHandlerName;
-        string? ToolAuthHandlerName;
-        if (turnContext.IsAgenticRequest())
-        {
-            ObservabilityAuthHandlerName = ToolAuthHandlerName = AgenticAuthHandlerName;
-        }
-        else
-        {
-            ObservabilityAuthHandlerName = ToolAuthHandlerName = OboAuthHandlerName;
-        }
+        string? ObservabilityAuthHandlerName = AgenticAuthHandlerName;
+        string? ToolAuthHandlerName = AgenticAuthHandlerName;
 
         await A365OtelWrapper.InvokeObservedAgentOperation(
             "MessageProcessor",
@@ -298,7 +294,7 @@ public class MyAgent : AgentApplication
                 // Production: use the A365 SDK's tooling gateway for server discovery
                 var handlerForMcp = !string.IsNullOrEmpty(authHandlerName)
                     ? authHandlerName
-                    : OboAuthHandlerName ?? AgenticAuthHandlerName ?? string.Empty;
+                    : AgenticAuthHandlerName ?? string.Empty;
                 var tokenOverride = string.IsNullOrEmpty(authHandlerName) ? accessToken : null;
 
                 allTools = await _toolService.GetMcpToolsAsync(agentId, UserAuthorization, handlerForMcp, context, tokenOverride).ConfigureAwait(false);
@@ -306,6 +302,31 @@ public class MyAgent : AgentApplication
 
             var w365Tools = FilterW365Tools(allTools);
             var additionalTools = FilterAdditionalTools(allTools);
+
+            // POC: register send_email_on_behalf reading the human Tc from Obo:UserAccessToken config.
+            if (!string.IsNullOrEmpty(_userAccessToken) && !string.IsNullOrEmpty(_agentIdentityAppId))
+            {
+                additionalTools ??= new List<AITool>();
+                additionalTools.Add(SendEmailOnBehalfTool.Create(
+                    _userAccessToken,
+                    _authHeaderProvider,
+                    _httpClientFactory,
+                    _agentIdentityAppId,
+                    _logger));
+                _logger.LogWarning(
+                    "OBO POC: registered send_email_on_behalf tool (tcLen={TcLen}, agentIdentity={AgentId}). Additional tools now: {Names}",
+                    _userAccessToken.Length,
+                    _agentIdentityAppId,
+                    string.Join(", ", additionalTools.Select(t => (t as AIFunction)?.Name ?? "?")));
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "OBO POC: send_email_on_behalf NOT registered. UserAccessToken set={TcSet}, AgentIdentityAppId='{AgentId}'.",
+                    !string.IsNullOrEmpty(_userAccessToken),
+                    _agentIdentityAppId ?? "(null)");
+            }
+
             return (w365Tools, additionalTools, mcpClient);
         }
         catch (Exception ex)

@@ -14,6 +14,9 @@ using Microsoft.Agents.Builder;
 using Microsoft.Agents.Core;
 using Microsoft.Agents.Hosting.AspNetCore;
 using Microsoft.Agents.Storage;
+using Microsoft.Identity.Abstractions;
+using Microsoft.Identity.Web;
+using Microsoft.Identity.Web.TokenCacheProviders.InMemory;
 using System.Reflection;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -58,6 +61,19 @@ builder.Services.AddSingleton<ComputerUseOrchestrator>();
 
 // Add AspNet token validation
 builder.Services.AddAgentAspNetAuthentication(builder.Configuration);
+
+// Agent-OBO: human-delegated token via agent identity (Microsoft.Identity.Web.AgentIdentities).
+// M.I.W. infers an auth scheme name (e.g. "OpenIdConnect") in an ASP.NET Core webapp and
+// looks up options under that name. Register the same AzureAd section under default + the
+// common scheme names so lookup succeeds regardless of inference.
+builder.Services
+    .AddTokenAcquisition()
+    .AddInMemoryTokenCaches()
+    .AddAgentIdentities()
+    .Configure<MicrosoftIdentityApplicationOptions>(builder.Configuration.GetSection("AzureAd"))
+    .Configure<MicrosoftIdentityApplicationOptions>("OpenIdConnect", builder.Configuration.GetSection("AzureAd"))
+    .Configure<MicrosoftIdentityApplicationOptions>("Bearer", builder.Configuration.GetSection("AzureAd"))
+    .Configure<MicrosoftIdentityApplicationOptions>("AzureAd", builder.Configuration.GetSection("AzureAd"));
 
 // Register IStorage. For development, MemoryStorage is suitable.
 builder.Services.AddSingleton<IStorage, MemoryStorage>();
