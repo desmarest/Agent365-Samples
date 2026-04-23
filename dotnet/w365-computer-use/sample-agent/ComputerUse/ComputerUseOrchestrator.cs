@@ -87,6 +87,16 @@ public class ComputerUseOrchestrator
     /// </summary>
     private IList<AITool>? _cachedNonW365Tools;
 
+    /// <summary>
+    /// True when this orchestrator has already loaded a tools/list for the W365 MCP server in
+    /// the current process. A tools/list call is what triggers ATG's hostname-discovery handler
+    /// to acquire a Cloud PC session, so if we've cached W365 tools, ATG has a live session
+    /// on our behalf and the agent doesn't need to show an "acquiring session" status.
+    /// Does not account for server-side idle reaps (~30 min on ATG) — those surface as tool-call
+    /// failures handled by the orchestrator's RecoverSessionAsync path.
+    /// </summary>
+    public bool HasCachedW365Tools => _cachedTools != null && _cachedTools.Any(t => IsW365CuaTool((t as AIFunction)?.Name));
+
     private const string SystemInstructions = """
         You are a helpful assistant that can also control a Windows desktop computer.
         If the user's message is conversational or doesn't require computer use, respond with a helpful text message.

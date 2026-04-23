@@ -244,9 +244,15 @@ public class MyAgent : AgentApplication
                     // the streaming activity that starts on the next line.
                     await turnContext.SendActivityAsync(MessageFactory.Text("Got it — working on it…"), cancellationToken).ConfigureAwait(false);
 
-                    // Announce session acquisition BEFORE kicking off the W365 tools/list
-                    // (which is what triggers ATG's hostname-discovery handler to acquire the pool session).
-                    await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Acquiring a Windows 365 Cloud PC session…");
+                    // Announce session acquisition ONLY when we don't already have W365 tools cached —
+                    // a cached tool list means ATG already has a live session on our behalf, so the
+                    // tools/list call returns instantly and there's nothing to acquire. Showing
+                    // "Acquiring…" on warm reuse is misleading.
+                    var willAcquireFreshSession = !_orchestrator.HasCachedW365Tools;
+                    if (willAcquireFreshSession)
+                    {
+                        await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Acquiring a Windows 365 Cloud PC session…");
+                    }
 
                     // Get MCP tools — direct connection in Dev, SDK in Production
                     var (w365Tools, additionalTools, mcpClient) = await GetToolsAsync(turnContext, ToolAuthHandlerName, includeW365: true);
