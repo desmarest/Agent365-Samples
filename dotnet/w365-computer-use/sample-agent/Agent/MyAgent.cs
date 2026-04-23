@@ -236,7 +236,15 @@ public class MyAgent : AgentApplication
                         return;
                     }
 
-                    // CUA path: announce session acquisition BEFORE kicking off the W365 tools/list
+                    // CUA path: SendActivity the "Got it" acknowledgment FIRST, before the streaming
+                    // response begins. If we send it later (e.g. from inside onCuaStarting), Teams/
+                    // Emulator orders it visually AFTER the streaming activity's final text since
+                    // the streaming activity was created earlier in the turn — the user sees the
+                    // result before the acknowledgment. SendActivity here gets an earlier ID than
+                    // the streaming activity that starts on the next line.
+                    await turnContext.SendActivityAsync(MessageFactory.Text("Got it — working on it…"), cancellationToken).ConfigureAwait(false);
+
+                    // Announce session acquisition BEFORE kicking off the W365 tools/list
                     // (which is what triggers ATG's hostname-discovery handler to acquire the pool session).
                     await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Acquiring a Windows 365 Cloud PC session…");
 
@@ -283,7 +291,6 @@ public class MyAgent : AgentApplication
                             onStatusUpdate: status => turnContext.StreamingResponse.QueueInformativeUpdateAsync(status).ConfigureAwait(false),
                             onCuaStarting: async (isNewSession) =>
                             {
-                                await turnContext.SendActivityAsync(MessageFactory.Text("Got it — working on it…"), cancellationToken).ConfigureAwait(false);
                                 if (isNewSession)
                                 {
                                     await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Starting a session to a Windows 365 Cloud PC…");
