@@ -29,6 +29,21 @@ public class MyAgent : AgentApplication
     private readonly ComputerUseOrchestrator _orchestrator;
     private readonly string[] _mcpServerUrls;
 
+    /// <summary>
+    /// Subset of <see cref="_mcpServerUrls"/> whose path names the W365 Computer-Use server.
+    /// Loaded only when the intent classifier determines CUA is required — otherwise the
+    /// tools/list call on this URL triggers ATG's hostname discovery and acquires a Cloud PC
+    /// session (10-30s). Match is by URL substring; relies on ATG's path convention of
+    /// keeping the server name in the path.
+    /// </summary>
+    private readonly string[] _w365McpServerUrls;
+
+    /// <summary>
+    /// All non-W365 MCP server URLs (mail, calendar, etc.). Loaded eagerly — these don't
+    /// acquire a W365 session.
+    /// </summary>
+    private readonly string[] _otherMcpServerUrls;
+
     private readonly string? AgenticAuthHandlerName;
     private readonly string? OboAuthHandlerName;
 
@@ -79,6 +94,12 @@ public class MyAgent : AgentApplication
             if (!string.IsNullOrEmpty(singleUrl))
                 _mcpServerUrls = [singleUrl];
         }
+
+        // Split into W365 vs other servers by URL path — W365 load is deferred until the
+        // intent classifier decides CUA is needed. Avoids paying the 10-30s session
+        // acquisition cost on chit-chat / mail-only messages.
+        _w365McpServerUrls = _mcpServerUrls.Where(u => u.Contains("/mcp_W365ComputerUse", StringComparison.OrdinalIgnoreCase)).ToArray();
+        _otherMcpServerUrls = _mcpServerUrls.Where(u => !u.Contains("/mcp_W365ComputerUse", StringComparison.OrdinalIgnoreCase)).ToArray();
 
         AgenticAuthHandlerName = configuration.GetValue<string>("AgentApplication:AgenticAuthHandlerName");
         OboAuthHandlerName = configuration.GetValue<string>("AgentApplication:OboAuthHandlerName");
@@ -186,9 +207,41 @@ public class MyAgent : AgentApplication
                 try
                 {
                     var userText = turnContext.Activity.Text?.Trim() ?? string.Empty;
+                    var conversationId = turnContext.Activity.Conversation?.Id ?? Guid.NewGuid().ToString();
+
+                    // Step 1: classify intent with a cheap tool-less LLM call. If the message
+                    // doesn't need desktop control ("hi", "summarize my inbox", etc.) we skip
+                    // W365 tool loading entirely so ATG never acquires a Cloud PC session.
+                    var needsCua = await _orchestrator.ClassifyNeedsCuaAsync(userText, cancellationToken);
+
+                    if (!needsCua)
+                    {
+                        // Non-CUA fast path: load only non-W365 tools, run orchestrator with the
+                        // computer tool withheld. Supports function-tool paths (mail/calendar/etc.)
+                        // without touching W365.
+                        var (_, nonCuaAdditionalTools, _) = await GetToolsAsync(turnContext, ToolAuthHandlerName, includeW365: false);
+                        var directResponse = await _orchestrator.RunAsync(
+                            conversationId,
+                            userText,
+                            w365Tools: [],
+                            additionalTools: nonCuaAdditionalTools,
+                            mcpClient: null,
+                            graphAccessToken: null,
+                            onStatusUpdate: status => turnContext.StreamingResponse.QueueInformativeUpdateAsync(status).ConfigureAwait(false),
+                            onCuaStarting: null,
+                            onFolderLinkReady: null,
+                            includeCuaTool: false,
+                            cancellationToken: cancellationToken);
+                        turnContext.StreamingResponse.QueueTextChunk(directResponse);
+                        return;
+                    }
+
+                    // CUA path: announce session acquisition BEFORE kicking off the W365 tools/list
+                    // (which is what triggers ATG's hostname-discovery handler to acquire the pool session).
+                    await turnContext.StreamingResponse.QueueInformativeUpdateAsync("Acquiring a Windows 365 Cloud PC session…");
 
                     // Get MCP tools — direct connection in Dev, SDK in Production
-                    var (w365Tools, additionalTools, mcpClient) = await GetToolsAsync(turnContext, ToolAuthHandlerName);
+                    var (w365Tools, additionalTools, mcpClient) = await GetToolsAsync(turnContext, ToolAuthHandlerName, includeW365: true);
 
                     try
                     {
@@ -220,7 +273,6 @@ public class MyAgent : AgentApplication
                         }
 
                         // Run the CUA loop — session is managed per conversation
-                        var conversationId = turnContext.Activity.Conversation?.Id ?? Guid.NewGuid().ToString();
                         var response = await _orchestrator.RunAsync(
                             conversationId,
                             userText,
@@ -262,8 +314,10 @@ public class MyAgent : AgentApplication
     /// Get MCP tools, separated into W365 (CUA) and additional (function) tools.
     /// In Development mode with a bearer token, connects directly to the MCP server URL.
     /// In Production, uses the A365 SDK to discover servers via the Tooling Gateway.
+    /// When <paramref name="includeW365"/> is <c>false</c>, the W365 server(s) are skipped —
+    /// used on the non-CUA fast path so ATG never acquires a Cloud PC session for chit-chat.
     /// </summary>
-    private async Task<(IList<AITool>? W365Tools, IList<AITool>? AdditionalTools, IMcpClient? Client)> GetToolsAsync(ITurnContext context, string? authHandlerName)
+    private async Task<(IList<AITool>? W365Tools, IList<AITool>? AdditionalTools, IMcpClient? Client)> GetToolsAsync(ITurnContext context, string? authHandlerName, bool includeW365)
     {
         // Acquire access token
         string? accessToken = null;
@@ -297,11 +351,26 @@ public class MyAgent : AgentApplication
             {
                 if (_mcpServerUrls.Length == 0)
                     throw new InvalidOperationException("McpServers (or McpServer:Url) is required in appsettings for Development mode.");
-                (allTools, mcpClient) = await _orchestrator.GetOrCreateMcpConnectionAsync(_mcpServerUrls, accessToken!);
+
+                if (includeW365)
+                {
+                    // Full load: W365 + everything else. The orchestrator's cache covers both.
+                    (allTools, mcpClient) = await _orchestrator.GetOrCreateMcpConnectionAsync(_mcpServerUrls, accessToken!);
+                }
+                else
+                {
+                    // Non-CUA fast path: skip W365 entirely. Non-W365 tools have their own cache
+                    // in the orchestrator so we don't reconnect on every non-CUA message.
+                    allTools = await _orchestrator.GetOrCreateNonW365McpConnectionAsync(_otherMcpServerUrls, accessToken!);
+                }
             }
             else
             {
-                // Production: use the A365 SDK's tooling gateway for server discovery
+                // Production: use the A365 SDK's tooling gateway for server discovery.
+                // NOTE: The SDK loads all registered servers' tools in one call, including W365.
+                // The includeW365 flag can't suppress the W365 load in prod today — the SDK has
+                // no per-server loading API. The CUA gate still saves compute on the non-CUA
+                // branch (no CUA loop, no screenshots), but not the Cloud PC session.
                 var handlerForMcp = !string.IsNullOrEmpty(authHandlerName)
                     ? authHandlerName
                     : OboAuthHandlerName ?? AgenticAuthHandlerName ?? string.Empty;
@@ -310,7 +379,7 @@ public class MyAgent : AgentApplication
                 allTools = await _toolService.GetMcpToolsAsync(agentId, UserAuthorization, handlerForMcp, context, tokenOverride).ConfigureAwait(false);
             }
 
-            var w365Tools = FilterW365Tools(allTools);
+            var w365Tools = includeW365 ? FilterW365Tools(allTools) : null;
             var additionalTools = FilterAdditionalTools(allTools);
             return (w365Tools, additionalTools, mcpClient);
         }

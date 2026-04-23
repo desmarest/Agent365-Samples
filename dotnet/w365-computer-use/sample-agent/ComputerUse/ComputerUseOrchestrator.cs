@@ -80,6 +80,13 @@ public class ComputerUseOrchestrator
     /// </summary>
     private IList<AITool>? _cachedTools;
 
+    /// <summary>
+    /// Tool list from non-W365 MCP servers (mail, calendar, etc.). Cached separately so that
+    /// non-CUA messages can be served without loading the W365 server's tools/list, which
+    /// triggers ATG's hostname-discovery handler and acquires a Cloud PC session (10-30s).
+    /// </summary>
+    private IList<AITool>? _cachedNonW365Tools;
+
     private const string SystemInstructions = """
         You are a helpful assistant that can also control a Windows desktop computer.
         If the user's message is conversational or doesn't require computer use, respond with a helpful text message.
@@ -159,7 +166,72 @@ public class ComputerUseOrchestrator
     }
 
     /// <summary>
-    /// Run the CUA loop for a specific conversation.
+    /// Lightweight intent classifier: decides whether a user message needs computer-use (CUA).
+    /// Runs a single tool-less model call and parses a strict YES/NO answer. On any parse error
+    /// or exception, returns <c>true</c> so we fall back to the full CUA loop — safer to pay
+    /// the W365 session cost than miss a legitimate computer-use request.
+    /// </summary>
+    public async Task<bool> ClassifyNeedsCuaAsync(string userMessage, CancellationToken cancellationToken = default)
+    {
+        const string ClassifierInstructions = """
+            You are a router. Decide whether the user's message requires controlling or managing a
+            Windows desktop: clicking, typing into apps, taking screenshots, opening programs,
+            interacting with the GUI, OR ending/releasing a Cloud PC session.
+            Answer with a single word:
+              YES  — if it needs desktop control or session management
+              NO   — if it is chit-chat, a question answerable from knowledge, or a request that can
+                     be fulfilled with mail/calendar/Teams/other function tools only
+            When uncertain, prefer YES.
+            """;
+
+        try
+        {
+            var body = JsonSerializer.Serialize(new ComputerUseRequest
+            {
+                Model = _modelProvider.ModelName,
+                Instructions = ClassifierInstructions,
+                Input = [CreateUserMessage(userMessage)],
+                Tools = [],
+                Truncation = "auto"
+            }, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+
+            var responseJson = await _modelProvider.SendAsync(body, cancellationToken);
+            var response = JsonSerializer.Deserialize<ComputerUseResponse>(responseJson);
+            if (response?.Output == null)
+            {
+                return true;
+            }
+
+            foreach (var item in response.Output)
+            {
+                if (item.TryGetProperty("type", out var tProp) && tProp.GetString() == "message")
+                {
+                    var replyText = ExtractText(item).Trim();
+                    _logger.LogInformation("CUA intent classifier reply for message {Preview}: {Reply}", Truncate(userMessage, 80), Truncate(replyText, 60));
+                    // Match on the first non-empty token. The router is instructed to emit a single
+                    // word but may prepend/append fluff; trim to the leading YES/NO.
+                    var upper = replyText.ToUpperInvariant();
+                    if (upper.StartsWith("NO")) return false;
+                    if (upper.StartsWith("YES")) return true;
+                    // Unexpected shape — default to CUA so we don't silently drop a legitimate request.
+                    return true;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "CUA intent classifier threw — defaulting to needsCua=true.");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Run the CUA loop for a specific conversation. When <paramref name="includeCuaTool"/> is
+    /// <c>false</c>, the <c>computer</c> tool is withheld from the model's tool list so it
+    /// cannot emit <c>computer_call</c> actions — used on the non-CUA fast path where the
+    /// router decided the message doesn't need desktop control, so no W365 session is acquired.
     /// </summary>
     public async Task<string> RunAsync(
         string conversationId,
@@ -171,6 +243,7 @@ public class ComputerUseOrchestrator
         Action<string>? onStatusUpdate = null,
         Func<bool, Task>? onCuaStarting = null,
         Func<string, Task>? onFolderLinkReady = null,
+        bool includeCuaTool = true,
         CancellationToken cancellationToken = default)
     {
         _logger.LogInformation("Processing message for conversation {ConversationId}: {Message}", conversationId, Truncate(userMessage, 100));
@@ -215,8 +288,14 @@ public class ComputerUseOrchestrator
             session.ConversationHistory.Add(CreateUserMessage(userMessage));
         }
 
-        // Build the model's tools list — computer + OnTaskComplete + any additional function tools
-        var modelTools = new List<object>(_tools);
+        // Build the model's tools list — computer + OnTaskComplete + any additional function tools.
+        // When includeCuaTool is false (non-CUA fast path), skip all CUA-specific tools entirely
+        // (computer, OnTaskComplete, EndSession). Those require an active W365 session, and the
+        // classifier has already decided we don't need one. Only the caller-provided additional
+        // tools (mail/calendar/etc.) remain visible to the model.
+        var modelTools = includeCuaTool
+            ? new List<object>(_tools)
+            : new List<object>();
         if (additionalTools?.Count > 0)
         {
             foreach (var tool in additionalTools.OfType<AIFunction>())
@@ -447,18 +526,64 @@ public class ComputerUseOrchestrator
             return (_cachedTools, _cachedMcpClient);
 
         // Stale caches from a failed prior attempt — clear before reconnecting.
-        if (_allMcpClients.Count > 0)
+        if (_cachedTools != null)
         {
-            foreach (var c in _allMcpClients)
-            {
-                try { await c.DisposeAsync(); }
-                catch (Exception disposeEx) { _logger.LogDebug(disposeEx, "Ignoring error disposing stale MCP client."); }
-            }
-            _allMcpClients.Clear();
-            _cachedMcpClient = null;
             _cachedTools = null;
+            _cachedMcpClient = null;
         }
 
+        var allTools = await LoadToolsFromUrlsAsync(mcpUrls, accessToken);
+
+        // Only cache when we got at least one W365 CUA tool. Otherwise leave _cachedTools null so
+        // the next message retries the MCP connection and gives ATG another shot at session acquisition.
+        var cachingIsSafe = allTools.Any(t => IsW365CuaTool((t as AIFunction)?.Name));
+        if (cachingIsSafe)
+        {
+            _cachedTools = allTools;
+        }
+        else
+        {
+            _logger.LogWarning("Not caching MCP tool list — no V2 CUA tools found (total {Count}). Next message will reconnect.", allTools.Count);
+        }
+
+        _logger.LogInformation("Total tools from {ServerCount} MCP server(s): {ToolCount}", mcpUrls.Count, allTools.Count);
+        return (allTools, _cachedMcpClient);
+    }
+
+    /// <summary>
+    /// Connects to non-W365 MCP servers (mail, calendar, etc.) and returns their merged tool
+    /// list. Unlike <see cref="GetOrCreateMcpConnectionAsync"/>, this path caches unconditionally
+    /// because non-W365 servers don't have the "Error-tool-after-failed-session-acquisition"
+    /// problem — if mail/calendar can't load, we just proceed without those tools.
+    /// </summary>
+    public async Task<IList<AITool>> GetOrCreateNonW365McpConnectionAsync(
+        IList<string> mcpUrls, string accessToken)
+    {
+        if (_cachedNonW365Tools != null)
+        {
+            return _cachedNonW365Tools;
+        }
+
+        if (mcpUrls.Count == 0)
+        {
+            _cachedNonW365Tools = [];
+            return _cachedNonW365Tools;
+        }
+
+        var tools = await LoadToolsFromUrlsAsync(mcpUrls, accessToken);
+        _cachedNonW365Tools = tools;
+        _logger.LogInformation("Loaded {Count} non-W365 MCP tools from {ServerCount} server(s).", tools.Count, mcpUrls.Count);
+        return tools;
+    }
+
+    /// <summary>
+    /// Opens SSE connections to each MCP server URL and merges their tools/list responses.
+    /// Side effects: adds each connected client to <see cref="_allMcpClients"/> for shutdown
+    /// cleanup, and sets <see cref="_cachedMcpClient"/> to the first client whose tools match
+    /// the W365 CUA set (used for direct screenshot calls in the CUA loop).
+    /// </summary>
+    private async Task<List<AITool>> LoadToolsFromUrlsAsync(IList<string> mcpUrls, string accessToken)
+    {
         var allTools = new List<AITool>();
 
         foreach (var url in mcpUrls)
@@ -500,20 +625,7 @@ public class ComputerUseOrchestrator
         // Fallback: use first client if no W365 server found
         _cachedMcpClient ??= _allMcpClients.FirstOrDefault();
 
-        // Only cache when we got at least one W365 CUA tool. Otherwise leave _cachedTools null so
-        // the next message retries the MCP connection and gives ATG another shot at session acquisition.
-        var cachingIsSafe = allTools.Any(t => IsW365CuaTool((t as AIFunction)?.Name));
-        if (cachingIsSafe)
-        {
-            _cachedTools = allTools;
-        }
-        else
-        {
-            _logger.LogWarning("Not caching MCP tool list — no V2 CUA tools found (total {Count}). Next message will reconnect.", allTools.Count);
-        }
-
-        _logger.LogInformation("Total tools from {ServerCount} MCP server(s): {ToolCount}", mcpUrls.Count, allTools.Count);
-        return (allTools, _cachedMcpClient);
+        return allTools;
     }
 
     private async Task<ComputerUseResponse?> CallModelAsync(List<JsonElement> conversation, List<object> tools, CancellationToken ct)
