@@ -332,13 +332,34 @@ public class ComputerUseOrchestrator
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // When running without the computer tool, strip past CUA turns from the history
-            // Azure OpenAI 400s on `computer_call_output` items when neither `computer` nor
-            // `computer_use_preview` is declared in this turn's tool set. The history is per-
-            // conversation, so prior CUA turns leave residue that breaks subsequent non-CUA turns.
-            var conversation = includeCuaTool
-                ? session.ConversationHistory
-                : session.ConversationHistory
+            // When running without the computer tool, strip past CUA-only turns from the history.
+            // Azure OpenAI 400s when an item references a tool that isn't declared in this turn:
+            //   - `computer_call` / `computer_call_output` need `computer` or `computer_use_preview`
+            //   - `function_call` / `function_call_output` for OnTaskComplete or EndSession need
+            //     those CUA-only function tools declared (we strip them in non-CUA modelTools).
+            // Two-pass: first identify the call_ids of CUA-only function_calls so we can also
+            // drop their paired function_call_outputs (which carry only call_id, not the name).
+            // session.ConversationHistory itself is left intact so a later CUA turn still sees
+            // the full record.
+            var conversation = session.ConversationHistory;
+            if (!includeCuaTool)
+            {
+                var cuaOnlyCallIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var item in session.ConversationHistory)
+                {
+                    if (!item.TryGetProperty("type", out var typeProp)) continue;
+                    if (typeProp.GetString() != "function_call") continue;
+                    if (!item.TryGetProperty("name", out var nameProp)) continue;
+                    var name = nameProp.GetString();
+                    if (name != "OnTaskComplete" && name != "EndSession") continue;
+                    if (item.TryGetProperty("call_id", out var idProp))
+                    {
+                        var id = idProp.GetString();
+                        if (!string.IsNullOrEmpty(id)) cuaOnlyCallIds.Add(id);
+                    }
+                }
+
+                conversation = session.ConversationHistory
                     .Where(item =>
                     {
                         if (!item.TryGetProperty("type", out var typeProp))
@@ -346,9 +367,22 @@ public class ComputerUseOrchestrator
                             return true;
                         }
                         var type = typeProp.GetString();
-                        return type != "computer_call" && type != "computer_call_output";
+                        if (type == "computer_call" || type == "computer_call_output")
+                        {
+                            return false;
+                        }
+                        if (type == "function_call" || type == "function_call_output")
+                        {
+                            if (item.TryGetProperty("call_id", out var idProp)
+                                && cuaOnlyCallIds.Contains(idProp.GetString() ?? string.Empty))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
                     })
                     .ToList();
+            }
 
             var response = await CallModelAsync(conversation, modelTools, cancellationToken);
             if (response?.Output == null || response.Output.Count == 0)
