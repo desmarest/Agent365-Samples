@@ -332,7 +332,25 @@ public class ComputerUseOrchestrator
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var response = await CallModelAsync(session.ConversationHistory, modelTools, cancellationToken);
+            // When running without the computer tool, strip past CUA turns from the history
+            // Azure OpenAI 400s on `computer_call_output` items when neither `computer` nor
+            // `computer_use_preview` is declared in this turn's tool set. The history is per-
+            // conversation, so prior CUA turns leave residue that breaks subsequent non-CUA turns.
+            var conversation = includeCuaTool
+                ? session.ConversationHistory
+                : session.ConversationHistory
+                    .Where(item =>
+                    {
+                        if (!item.TryGetProperty("type", out var typeProp))
+                        {
+                            return true;
+                        }
+                        var type = typeProp.GetString();
+                        return type != "computer_call" && type != "computer_call_output";
+                    })
+                    .ToList();
+
+            var response = await CallModelAsync(conversation, modelTools, cancellationToken);
             if (response?.Output == null || response.Output.Count == 0)
                 break;
 
