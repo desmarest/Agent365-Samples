@@ -413,14 +413,12 @@ public class ComputerUseOrchestrator
                                 if (onCuaStarting != null)
                                     await onCuaStarting(true);
                                 onStatusUpdate?.Invoke("Starting W365 computing session...");
-                                session.W365SessionId = await StartSessionAsync(w365Tools, _logger, cancellationToken);
                                 session.SessionStarted = true;
-                                // Update subfolder to use W365 session ID instead of conversation ID
-                                var safeSessionId = session.W365SessionId != null
-                                    ? new string(session.W365SessionId.Where(c => char.IsLetterOrDigit(c) || c == '-').ToArray())
-                                    : "unknown";
-                                session.ScreenshotSubfolder = $"{DateTime.UtcNow:yyyyMMdd}_{safeSessionId}";
-                                _logger.LogInformation("Session started for conversation {ConversationId}, W365SessionId={SessionId}", conversationId, session.W365SessionId);
+                                // V2: sessions are acquired transparently by ATG's hostname-discovery handler
+                                // on the first MCP call, so there's no W365 session ID returned to the agent
+                                // and no rename needed — the conversation-id-based screenshot subfolder set in
+                                // GetOrAdd above stays.
+                                _logger.LogInformation("Session marked started for conversation {ConversationId}", conversationId);
                             }
                             else if (onCuaStarting != null)
                             {
@@ -557,18 +555,6 @@ public class ComputerUseOrchestrator
 
         _allMcpClients.Clear();
         _cachedMcpClient = null;
-    }
-
-    /// <summary>
-    /// V2 has no explicit start-session tool — the W365 V2 session is acquired transparently
-    /// by ATG's hostname-discovery handler the first time this conversation issues any MCP
-    /// request (tools/list or tools/call). This method is kept for call-site compatibility
-    /// but is now a no-op that returns null.
-    /// </summary>
-    public static Task<string?> StartSessionAsync(IList<AITool> tools, ILogger logger, CancellationToken ct)
-    {
-        logger.LogInformation("W365 V2: session acquisition is transparent via hostname discovery — no explicit start.");
-        return Task.FromResult<string?>(null);
     }
 
     /// <summary>
@@ -734,8 +720,9 @@ public class ComputerUseOrchestrator
                     if (sessionLost)
                     {
                         onStatus?.Invoke("Session lost — recovering...");
-                        sessionId = await RecoverSessionAsync(session, tools, _logger, ct);
-                        (toolName, args) = MapActionToMcpTool(actionType, action, sessionId);
+                        await RecoverSessionAsync(session, tools, _logger, ct);
+                        // Re-invoke with the same args; ATG re-acquires the session transparently
+                        // on this retry via the hostname-discovery handler.
                         await InvokeToolThrowOnErrorAsync(tools, toolName, args, ct);
                     }
                     else if (TryExtractToolError(result?.ToString(), out var errorText))
@@ -759,8 +746,9 @@ public class ComputerUseOrchestrator
                 if (sessionLost)
                 {
                     onStatus?.Invoke("Session lost — recovering...");
-                    sessionId = await RecoverSessionAsync(session, tools, _logger, ct);
-                    (toolName, args) = MapActionToMcpTool(actionType, singleAction, sessionId);
+                    await RecoverSessionAsync(session, tools, _logger, ct);
+                    // Re-invoke with the same args; ATG re-acquires the session transparently
+                    // on this retry via the hostname-discovery handler.
                     await InvokeToolThrowOnErrorAsync(tools, toolName, args, ct);
                 }
                 else if (TryExtractToolError(result?.ToString(), out var errorText))
@@ -1144,12 +1132,15 @@ public class ComputerUseOrchestrator
     }
 
     /// <summary>
-    /// Recover from a lost session: end the stale session (best-effort) and start a new one.
+    /// Recover from a lost session: release the stale session (best-effort) and reset the
+    /// session-state flags so the next MCP tool call triggers a fresh checkout via ATG's
+    /// hostname-discovery handler. There is no explicit "start" step in V2 — the session
+    /// is acquired transparently when the orchestrator's next computer_call goes through.
     /// </summary>
-    private async Task<string?> RecoverSessionAsync(
+    private async Task RecoverSessionAsync(
         ConversationSession session, IList<AITool> tools, ILogger logger, CancellationToken ct)
     {
-        logger.LogWarning("Session lost for W365SessionId={SessionId}. Recovering — ending stale session and starting new one.", session.W365SessionId);
+        logger.LogWarning("Session lost. Recovering — releasing stale session; ATG will re-acquire on next MCP call.");
 
         try
         {
@@ -1157,14 +1148,12 @@ public class ComputerUseOrchestrator
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Best-effort EndSession during recovery failed for {SessionId}", session.W365SessionId);
+            logger.LogWarning(ex, "Best-effort EndSession during recovery failed");
         }
 
-        var newSessionId = await StartSessionAsync(tools, logger, ct);
-        session.W365SessionId = newSessionId;
-        session.SessionStarted = true;
-        logger.LogInformation("Session recovered. New W365SessionId={SessionId}", newSessionId);
-        return newSessionId;
+        session.W365SessionId = null;
+        session.SessionStarted = false;
+        logger.LogInformation("Session state cleared; awaiting transparent re-acquisition.");
     }
 
     private static string[] ExtractKeys(JsonElement action)
