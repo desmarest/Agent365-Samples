@@ -928,26 +928,31 @@ public class ComputerUseOrchestrator
     /// </summary>
     private static (string ToolName, Dictionary<string, object?> Args) MapActionToMcpTool(string actionType, JsonElement action, string? sessionId)
     {
-        // CUA model emits button names in lowercase ("left"/"right"); V2 click accepts PascalCase enum values.
-        static string NormalizeButton(string? button) => string.IsNullOrEmpty(button)
-            ? "Left"
-            : char.ToUpperInvariant(button[0]) + button.Substring(1).ToLowerInvariant();
-
         return actionType.ToLowerInvariant() switch
         {
             "click" => ("click", new Dictionary<string, object?>
             {
                 ["x"] = action.GetProperty("x").GetInt32(),
                 ["y"] = action.GetProperty("y").GetInt32(),
-                ["button"] = NormalizeButton(action.TryGetProperty("button", out var b) ? b.GetString() : null),
+                ["button"] = CuaActionNormalization.NormalizeMouseButton(
+                    action.TryGetProperty("button", out var b) ? b.GetString() : null),
                 ["clickCount"] = 1
             }),
             "double_click" => ("click", new Dictionary<string, object?>
             {
                 ["x"] = action.GetProperty("x").GetInt32(),
                 ["y"] = action.GetProperty("y").GetInt32(),
-                ["button"] = "Left",
+                ["button"] = CuaActionNormalization.NormalizeMouseButton(
+                    action.TryGetProperty("button", out var dcb) ? dcb.GetString() : null),
                 ["clickCount"] = 2
+            }),
+            "triple_click" => ("click", new Dictionary<string, object?>
+            {
+                ["x"] = action.GetProperty("x").GetInt32(),
+                ["y"] = action.GetProperty("y").GetInt32(),
+                ["button"] = CuaActionNormalization.NormalizeMouseButton(
+                    action.TryGetProperty("button", out var tcb) ? tcb.GetString() : null),
+                ["clickCount"] = 3
             }),
             "type" => ("type_text", new Dictionary<string, object?>
             {
@@ -955,10 +960,12 @@ public class ComputerUseOrchestrator
             }),
             "key" or "keys" or "keypress" => ("press_keys", new Dictionary<string, object?>
             {
-                // TEMP (2026-04-22): model emits uppercase key names like "CTRL"/"ESC", but W365's
-                // press_keys tool appears to reject them. Experimenting with lowercase — revert or
-                // normalize differently once Vishnu confirms the expected format.
-                ["keys"] = ExtractKeys(action).Select(k => k.ToLowerInvariant()).ToArray()
+                // The OpenAI CUA model emits W3C-flavored key names (e.g. "ArrowDown",
+                // "Control", "Escape"). W365's press_keys rejects those with "Unknown key
+                // name" — see CuaActionNormalization for the alias map. This is exactly the
+                // client-side normalization OpenAI's docs recommend:
+                // https://developers.openai.com/api/docs/guides/tools-computer-use#3-run-every-returned-action
+                ["keys"] = CuaActionNormalization.NormalizeKeys(ExtractKeys(action))
             }),
             "scroll" => ("scroll", new Dictionary<string, object?>
             {
@@ -978,7 +985,8 @@ public class ComputerUseOrchestrator
                 ["startY"] = action.GetProperty("path")[0].GetProperty("y").GetInt32(),
                 ["endX"] = action.GetProperty("path")[action.GetProperty("path").GetArrayLength() - 1].GetProperty("x").GetInt32(),
                 ["endY"] = action.GetProperty("path")[action.GetProperty("path").GetArrayLength() - 1].GetProperty("y").GetInt32(),
-                ["button"] = "Left"
+                ["button"] = CuaActionNormalization.NormalizeMouseButton(
+                    action.TryGetProperty("button", out var dragB) ? dragB.GetString() : null)
             }),
             "wait" => ("wait_milliseconds", new Dictionary<string, object?>
             {
