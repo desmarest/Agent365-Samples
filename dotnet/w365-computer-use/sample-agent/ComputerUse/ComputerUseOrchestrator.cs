@@ -124,6 +124,22 @@ public class ComputerUseOrchestrator
         nothing. Never call OnTaskComplete without a preceding answer message.
         Do NOT continue computer actions after the task is done.
 
+        ## Live progress narration (narrate tool)
+        Use the `narrate(reason)` function to send the user a short natural-language status
+        update — one sentence, present tense — frequently while you work. Narrate:
+          - Before clicking a major button or link ("Clicking Search to run the query")
+          - Before filling a field ("Entering 'Obesity' into the Condition box")
+          - Before scrolling to find something ("Scrolling to find the Study Status filter")
+          - When starting a new phase ("Opening ClinicalTrials.gov to search for GLP-1 trials")
+          - After completing a sub-task ("Search form filled, submitting now")
+          - When changing context ("Opening the first trial to read its details")
+          - When recovering from an unexpected page state ("Page didn't load, refreshing")
+        Aim for one narration every 2-3 actions. It's better to over-narrate than under-narrate.
+        Skip narration only for trivially repetitive actions (e.g. four scroll wheels in a row to
+        reach the bottom of a page — narrate once at the start, not for each scroll).
+        Narrate produces a live banner only — it carries no persistent chat content, so do NOT
+        use it as a substitute for the final answer message before OnTaskComplete.
+
         ## EndSession (release the Cloud PC)
         Call EndSession ONLY when the user explicitly asks to release, disconnect from, end,
         or quit their Cloud PC / VM / remote session itself. Examples that DO trigger EndSession:
@@ -184,6 +200,25 @@ public class ComputerUseOrchestrator
             {
                 Name = "EndSession",
                 Description = "Release the Cloud PC / VM back to the pool and terminate the remote desktop session. Use ONLY when the user explicitly asks to end, quit, disconnect from, or release their Cloud PC / remote session itself (e.g. 'end my session', 'release the VM', 'disconnect from the cloud pc'). Do NOT call this when the user asks to close applications, windows, tabs, or files running inside the VM — those are normal computer-use actions that leave the VM running."
+            },
+            new FunctionToolDefinition
+            {
+                Name = "narrate",
+                Description = "Send a short natural-language progress update to the user (one sentence, present tense) at meaningful checkpoints. Use sparingly — roughly every 5-10 actions or at phase transitions. The update appears as a live banner only (no persistent chat content). Do not use as a substitute for the final answer message before OnTaskComplete.",
+                Parameters = new
+                {
+                    type = "object",
+                    properties = new
+                    {
+                        reason = new
+                        {
+                            type = "string",
+                            description = "One-sentence status, present tense (e.g. 'Opening the first trial to extract details')."
+                        }
+                    },
+                    required = new[] { "reason" },
+                    additionalProperties = false
+                }
             }
         ];
     }
@@ -506,6 +541,37 @@ public class ComputerUseOrchestrator
                         hasActions = true;
                         var funcName = item.GetProperty("name").GetString();
                         _logger.LogInformation("CUA iteration {Iteration}: function_call {Name}", i + 1, funcName);
+                        if (funcName == "narrate")
+                        {
+                            // Forward the model-supplied reason to the live informative-update banner.
+                            // narrate is non-terminal: ack the call so history stays valid and let the
+                            // loop continue to the next iteration (or to the paired computer_call in
+                            // the same turn).
+                            string reason = "";
+                            if (item.TryGetProperty("arguments", out var argsProp))
+                            {
+                                var argsStr = argsProp.GetString();
+                                if (!string.IsNullOrEmpty(argsStr))
+                                {
+                                    try
+                                    {
+                                        using var argsDoc = JsonDocument.Parse(argsStr);
+                                        if (argsDoc.RootElement.TryGetProperty("reason", out var reasonProp))
+                                            reason = reasonProp.GetString() ?? "";
+                                    }
+                                    catch (JsonException) { /* malformed args — drop this narration */ }
+                                }
+                            }
+
+                            if (!string.IsNullOrEmpty(reason))
+                            {
+                                _logger.LogInformation("Model narration: {Reason}", reason);
+                                onStatusUpdate?.Invoke(reason);
+                            }
+
+                            session.ConversationHistory.Add(CreateFunctionOutput(item.GetProperty("call_id").GetString()!));
+                            break;
+                        }
                         if (funcName == "OnTaskComplete")
                         {
                             session.ConversationHistory.Add(CreateFunctionOutput(item.GetProperty("call_id").GetString()!));
@@ -772,7 +838,10 @@ public class ComputerUseOrchestrator
             foreach (var action in actionsArray.EnumerateArray())
             {
                 var actionType = action.GetProperty("type").GetString()!;
-                onStatus?.Invoke($"Performing: {actionType}...");
+                // Per-action banners ("Performing: click...") are suppressed — the live banner is
+                // reserved for model-driven narrate() calls so demo footage isn't dominated by
+                // mechanical tool-use updates. Session-lifecycle banners (acquire / end / recover)
+                // still fire below.
 
                 if (actionType != "screenshot")
                 {
@@ -798,7 +867,7 @@ public class ComputerUseOrchestrator
         else if (call.TryGetProperty("action", out var singleAction))
         {
             var actionType = singleAction.GetProperty("type").GetString()!;
-            onStatus?.Invoke($"Performing: {actionType}...");
+            // Per-action banner suppressed — see comment in the actions-array branch above.
 
             if (actionType != "screenshot")
             {
