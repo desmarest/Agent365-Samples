@@ -117,9 +117,22 @@ public class ComputerUseOrchestrator
         Only use computer actions when no function tool can accomplish the task.
         When a task requires computer use, perform the actions and examine screenshots to verify they worked.
         If you see browser setup or sign-in dialogs, dismiss them (Escape, X, or Skip).
-        Once you have completed a computer use task, call the OnTaskComplete function.
-        Do NOT continue looping after the task is done.
-        If the user wants to end, quit, or disconnect their session, call the EndSession function.
+        When you have completed a computer-use task: FIRST emit a text message containing
+        the full answer (extracted data, summary, table, etc.) the user asked for. THEN call
+        OnTaskComplete in the same turn. The OnTaskComplete function is a completion signal
+        only — it carries no user-visible content. If you skip the message, the user sees
+        nothing. Never call OnTaskComplete without a preceding answer message.
+        Do NOT continue computer actions after the task is done.
+
+        ## EndSession (release the Cloud PC)
+        Call EndSession ONLY when the user explicitly asks to release, disconnect from, end,
+        or quit their Cloud PC / VM / remote session itself. Examples that DO trigger EndSession:
+        "end my session", "release the VM", "disconnect from the cloud pc", "I'm done, log me out".
+        Closing applications, windows, browser tabs, or files INSIDE the VM is a normal computer-use
+        task — perform it with clicks/keystrokes and then call OnTaskComplete. Do NOT call EndSession
+        for requests like "close all apps", "close the browser", "close this window", or "shut down
+        Notepad" — those keep the VM running.
+
         If the user sends a casual greeting or question that does not require computer use, reply with a helpful text message.
         """;
 
@@ -170,7 +183,7 @@ public class ComputerUseOrchestrator
             new FunctionToolDefinition
             {
                 Name = "EndSession",
-                Description = "Call this function when the user wants to end, quit, disconnect, or release their computer session."
+                Description = "Release the Cloud PC / VM back to the pool and terminate the remote desktop session. Use ONLY when the user explicitly asks to end, quit, disconnect from, or release their Cloud PC / remote session itself (e.g. 'end my session', 'release the VM', 'disconnect from the cloud pc'). Do NOT call this when the user asks to close applications, windows, tabs, or files running inside the VM — those are normal computer-use actions that leave the VM running."
             }
         ];
     }
@@ -185,13 +198,27 @@ public class ComputerUseOrchestrator
     {
         const string ClassifierInstructions = """
             You are a router. Decide whether the user's message requires controlling or managing a
-            Windows desktop: clicking, typing into apps, taking screenshots, opening programs,
-            interacting with the GUI, OR ending/releasing a Cloud PC session.
-            Answer with a single word:
-              YES  — if it needs desktop control or session management
-              NO   — if it is chit-chat, a question answerable from knowledge, or a request that can
-                     be fulfilled with mail/calendar/Teams/other function tools only
-            When uncertain, prefer YES.
+            Windows desktop / Cloud PC. Answer with a single word: YES or NO.
+
+            Answer YES for any of:
+              - clicking, typing, scrolling, dragging, taking screenshots
+              - opening or closing programs, files, browser tabs, or windows
+              - navigating to a URL, browsing a webpage, filling a web form, downloading a file
+              - reading or extracting content from a webpage, document, or app on the desktop
+                (e.g. "tell me what's on this page", "what does the screen show", "list the
+                results on clinicaltrials.gov", "read the Word doc that's open")
+              - any action phrased as "go to <url>", "open <url>", "navigate to <url>",
+                "load <url>", or any direct URL the user expects to be visited
+              - ending, quitting, disconnecting, or releasing the Cloud PC / VM / remote session
+
+            Answer NO only for:
+              - greetings, chit-chat, thanks, "how are you"
+              - questions answerable from general knowledge with no reference to the desktop
+                or any web URL
+              - requests that an available function tool (mail, calendar, Teams) can fulfill
+                without touching the desktop
+
+            When uncertain, answer YES.
             """;
 
         try
@@ -328,6 +355,11 @@ public class ComputerUseOrchestrator
         }
 
         var cuaAcknowledged = false;
+        // Tracks the latest user-facing answer text emitted by the model. Captured (not returned)
+        // on every `message` item so that an OnTaskComplete in the same turn — emitted in either
+        // order, [message, function_call] or [function_call, message] — still returns the answer
+        // instead of the canned "Task completed successfully." string.
+        string? finalAnswerText = null;
         for (var i = 0; i < _maxIterations; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -371,6 +403,13 @@ public class ComputerUseOrchestrator
                         {
                             return false;
                         }
+                        // Reasoning items are produced by gpt-5.4-family models to pair with the
+                        // *next* tool call. In non-CUA mode the computer_call is stripped above,
+                        // so the reasoning item would dangle — strip it too.
+                        if (type == "reasoning")
+                        {
+                            return false;
+                        }
                         if (type == "function_call" || type == "function_call_output")
                         {
                             if (item.TryGetProperty("call_id", out var idProp)
@@ -393,14 +432,31 @@ public class ComputerUseOrchestrator
             foreach (var item in response.Output)
             {
                 var type = item.GetProperty("type").GetString();
-                if (type == "reasoning") continue;
+
+                // gpt-5.4-family reasoning models (gpt-5.4, gpt-5.4-pro) pair every computer_call /
+                // function_call with a preceding reasoning item; the Responses API rejects subsequent
+                // turns that include the tool call but not its reasoning ("Item 'cu_…' of type
+                // 'computer_call' was provided without its required 'reasoning' item: 'rs_…'.").
+                // Persist reasoning items so they accompany their tool call on the next turn.
+                // Lighter variants (gpt-5.4-mini, computer-use-preview) don't emit standalone
+                // reasoning items, so this branch is a no-op for them.
+                if (type == "reasoning")
+                {
+                    session.ConversationHistory.Add(item);
+                    continue;
+                }
 
                 session.ConversationHistory.Add(item);
 
                 switch (type)
                 {
                     case "message":
-                        return ExtractText(item);
+                        // Capture but do NOT return: a same-turn function_call(OnTaskComplete)
+                        // emitted after this message would otherwise be skipped, losing the
+                        // history ack. Loop continues; the captured text is returned later
+                        // either by OnTaskComplete or by the post-foreach fallback below.
+                        finalAnswerText = ExtractText(item);
+                        break;
 
                     case "computer_call":
                         hasActions = true;
@@ -453,7 +509,8 @@ public class ComputerUseOrchestrator
                         if (funcName == "OnTaskComplete")
                         {
                             session.ConversationHistory.Add(CreateFunctionOutput(item.GetProperty("call_id").GetString()!));
-                            return "Task completed successfully.";
+                            return finalAnswerText
+                                ?? $"Task complete, but the model did not include a final answer. Screenshots saved to ./Screenshots/{session.ScreenshotSubfolder}.";
                         }
                         if (funcName == "EndSession")
                         {
@@ -488,7 +545,11 @@ public class ComputerUseOrchestrator
             if (!hasActions) break;
         }
 
-        return "The task could not be completed within the allowed number of steps.";
+        // Loop exited without an explicit return: either the model produced a message-only turn
+        // (no actions, no OnTaskComplete) — preserve the historical "message terminates the turn"
+        // behavior by returning the captured text — or it exhausted iterations.
+        return finalAnswerText
+            ?? "The task could not be completed within the allowed number of steps.";
     }
 
     /// <summary>
