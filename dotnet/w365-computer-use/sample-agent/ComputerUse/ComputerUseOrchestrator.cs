@@ -17,6 +17,16 @@ namespace W365ComputerUseSample.ComputerUse;
 /// </summary>
 public class ComputerUseOrchestrator
 {
+    private const string StartScreenShareFunctionName = "StartScreenShare";
+    private const string StopScreenShareFunctionName = "StopScreenShare";
+    private const string TakeScreenShareControlFunctionName = "TakeScreenShareControl";
+    private const string ReleaseScreenShareControlFunctionName = "ReleaseScreenShareControl";
+
+    private const string StartScreenShareMcpToolName = "mcp_W365ComputerUse_StartScreenShare";
+    private const string StopScreenShareMcpToolName = "mcp_W365ComputerUse_StopScreenShare";
+    private const string TakeScreenShareControlMcpToolName = "mcp_W365ComputerUse_TakeScreenShareControl";
+    private const string ReleaseScreenShareControlMcpToolName = "mcp_W365ComputerUse_ReleaseScreenShareControl";
+
     /// <summary>
     /// Names of the CUA tools exposed by the W365 remote MCP server (as returned by its
     /// tools/list). Used to identify which tools came from the W365 server vs other MCP servers
@@ -40,8 +50,12 @@ public class ComputerUseOrchestrator
         "browser_eval_js", "browser_screenshot", "focus_browser",
         // Code / shell execution
         "execute_python_code", "execute_shell_command",
-        // ATG-local tool
+        // ATG-local tools
         "mcp_W365ComputerUse_EndSession",
+        StartScreenShareMcpToolName,
+        StopScreenShareMcpToolName,
+        TakeScreenShareControlMcpToolName,
+        ReleaseScreenShareControlMcpToolName,
     };
 
     /// <summary>Returns true when <paramref name="toolName"/> identifies a W365 CUA tool.</summary>
@@ -150,6 +164,17 @@ public class ComputerUseOrchestrator
         Notepad" — those keep the VM running.
 
         If the user sends a casual greeting or question that does not require computer use, reply with a helpful text message.
+
+        ## Screen sharing for human observation/control
+        Use the screen sharing functions only when the user explicitly asks to observe, share, stop sharing,
+        take remote control, or release remote control for the Cloud PC. Screen sharing is for a human to
+        watch or control the Cloud PC; agent automation should continue using the computer tool.
+        - Call StartScreenShare when the user asks for a viewer link, to watch, or to share the Cloud PC screen.
+        - Call StopScreenShare when the user asks to stop or close screen sharing.
+        - Call TakeScreenShareControl when the user asks to take mouse/keyboard control. Explain that the most recent TakeControl caller wins.
+        - Call ReleaseScreenShareControl when the user asks to release remote control.
+        If a human has control and the user asks you to automate the desktop, proceed with the concrete task
+        but be careful because human and agent inputs can conflict.
         """;
 
     public ComputerUseOrchestrator(
@@ -203,6 +228,26 @@ public class ComputerUseOrchestrator
             },
             new FunctionToolDefinition
             {
+                Name = StartScreenShareFunctionName,
+                Description = "Start W365 Cloud PC screen sharing and return a viewer link to the user. Use only when the user explicitly asks to share the screen, watch the Cloud PC, observe the session, or get a viewer link. This is for human observation/control, not agent automation."
+            },
+            new FunctionToolDefinition
+            {
+                Name = StopScreenShareFunctionName,
+                Description = "Stop W365 Cloud PC screen sharing. Use only when the user explicitly asks to stop sharing, close the viewer, or end human observation/control. This does not end the Cloud PC session."
+            },
+            new FunctionToolDefinition
+            {
+                Name = TakeScreenShareControlFunctionName,
+                Description = "Give the requesting human remote mouse/keyboard control of the Cloud PC screen share. Use only when the user explicitly asks to take control. The most recent TakeControl caller wins; agent automation can still run cooperatively but inputs may conflict."
+            },
+            new FunctionToolDefinition
+            {
+                Name = ReleaseScreenShareControlFunctionName,
+                Description = "Release the requesting human's remote mouse/keyboard control while keeping screen sharing available for observation. Use only when the user explicitly asks to release control."
+            },
+            new FunctionToolDefinition
+            {
                 Name = "narrate",
                 Description = "Send a short natural-language progress update to the user (one sentence, present tense) at meaningful checkpoints. Use sparingly — roughly every 5-10 actions or at phase transitions. The update appears as a live banner only (no persistent chat content). Do not use as a substitute for the final answer message before OnTaskComplete.",
                 Parameters = new
@@ -242,6 +287,9 @@ public class ComputerUseOrchestrator
               - reading or extracting content from a webpage, document, or app on the desktop
                 (e.g. "tell me what's on this page", "what does the screen show", "list the
                 results on clinicaltrials.gov", "read the Word doc that's open")
+              - starting, stopping, observing, or controlling W365 screen sharing
+                (e.g. "share the screen", "let me watch the Cloud PC", "give me a viewer link",
+                "take control", "release control", "stop sharing")
               - any action phrased as "go to <url>", "open <url>", "navigate to <url>",
                 "load <url>", or any direct URL the user expects to be visited
               - ending, quitting, disconnecting, or releasing the Cloud PC / VM / remote session
@@ -335,6 +383,17 @@ public class ComputerUseOrchestrator
             _logger.LogInformation("Reusing session for conversation {ConversationId}, W365SessionId={SessionId}", conversationId, session.W365SessionId);
         }
 
+        if (includeCuaTool
+            && session.HumanControlActive
+            && !session.WarnedAboutHumanControl
+            && !IsScreenshareManagementRequest(userMessage))
+        {
+            const string warning = "A human currently has remote control of the Cloud PC. Agent inputs may conflict with human mouse or keyboard input, so I will proceed carefully.";
+            onStatusUpdate?.Invoke(warning);
+            session.ConversationHistory.Add(CreateUserMessage($"System note: {warning}"));
+            session.WarnedAboutHumanControl = true;
+        }
+
         // For "computer" tool type (gpt-5.4+), include a screenshot with the FIRST user message if session already active
         if (_toolType == "computer" && session.ConversationHistory.Count == 0 && session.SessionStarted)
         {
@@ -395,6 +454,7 @@ public class ComputerUseOrchestrator
         // order, [message, function_call] or [function_call, message] — still returns the answer
         // instead of the canned "Task completed successfully." string.
         string? finalAnswerText = null;
+        string? directReturnText = null;
         for (var i = 0; i < _maxIterations; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -418,7 +478,7 @@ public class ComputerUseOrchestrator
                     if (typeProp.GetString() != "function_call") continue;
                     if (!item.TryGetProperty("name", out var nameProp)) continue;
                     var name = nameProp.GetString();
-                    if (name != "OnTaskComplete" && name != "EndSession") continue;
+                    if (!IsCuaOnlyFunctionName(name)) continue;
                     if (item.TryGetProperty("call_id", out var idProp))
                     {
                         var id = idProp.GetString();
@@ -593,8 +653,17 @@ public class ComputerUseOrchestrator
                             await EndSessionAsync(w365Tools, _logger, session.W365SessionId, cancellationToken);
                             session.SessionStarted = false;
                             session.W365SessionId = null;
+                            ResetScreenshareState(session);
                             _sessions.TryRemove(conversationId, out _);
                             return "Session ended. The VM has been released back to the pool.";
+                        }
+                        if (funcName != null && IsScreenshareFunctionName(funcName))
+                        {
+                            var callId = item.GetProperty("call_id").GetString()!;
+                            var userMessageText = await HandleScreenshareFunctionAsync(funcName, w365Tools, session, cancellationToken);
+                            session.ConversationHistory.Add(CreateFunctionOutput(callId, "Screen sharing action completed. Viewer URLs are returned directly to the user and are not stored in model history."));
+                            directReturnText = userMessageText;
+                            break;
                         }
 
                         // Invoke additional MCP function tool
@@ -606,6 +675,11 @@ public class ComputerUseOrchestrator
 
                         break;
                 }
+            }
+
+            if (directReturnText != null)
+            {
+                return directReturnText;
             }
 
             if (!hasActions) break;
@@ -642,6 +716,160 @@ public class ComputerUseOrchestrator
         catch (Exception ex)
         {
             logger.LogWarning(ex, "Failed to end W365 session");
+        }
+    }
+
+    private static bool IsCuaOnlyFunctionName(string? functionName)
+        => string.Equals(functionName, "OnTaskComplete", StringComparison.Ordinal)
+           || string.Equals(functionName, "EndSession", StringComparison.Ordinal)
+           || IsScreenshareFunctionName(functionName);
+
+    private static bool IsScreenshareFunctionName(string? functionName)
+        => string.Equals(functionName, StartScreenShareFunctionName, StringComparison.Ordinal)
+           || string.Equals(functionName, StopScreenShareFunctionName, StringComparison.Ordinal)
+           || string.Equals(functionName, TakeScreenShareControlFunctionName, StringComparison.Ordinal)
+           || string.Equals(functionName, ReleaseScreenShareControlFunctionName, StringComparison.Ordinal);
+
+    private static bool IsScreenshareManagementRequest(string userMessage)
+    {
+        var normalized = userMessage.ToLowerInvariant();
+        return normalized.Contains("screen share", StringComparison.Ordinal)
+               || normalized.Contains("screenshare", StringComparison.Ordinal)
+               || normalized.Contains("share screen", StringComparison.Ordinal)
+               || normalized.Contains("share the screen", StringComparison.Ordinal)
+               || normalized.Contains("viewer link", StringComparison.Ordinal)
+               || normalized.Contains("let me watch", StringComparison.Ordinal)
+               || normalized.Contains("take control", StringComparison.Ordinal)
+               || normalized.Contains("release control", StringComparison.Ordinal)
+               || normalized.Contains("stop sharing", StringComparison.Ordinal);
+    }
+
+    private async Task<string> HandleScreenshareFunctionAsync(
+        string functionName,
+        IList<AITool> w365Tools,
+        ConversationSession session,
+        CancellationToken cancellationToken)
+    {
+        if (w365Tools.Count == 0)
+        {
+            _logger.LogWarning("Screen sharing function {FunctionName} was requested, but no W365 tools are available.", functionName);
+            return "Screen sharing tools are not available yet. Please try again after the W365 MCP tools load successfully.";
+        }
+
+        var mcpToolName = functionName switch
+        {
+            StartScreenShareFunctionName => StartScreenShareMcpToolName,
+            StopScreenShareFunctionName => StopScreenShareMcpToolName,
+            TakeScreenShareControlFunctionName => TakeScreenShareControlMcpToolName,
+            ReleaseScreenShareControlFunctionName => ReleaseScreenShareControlMcpToolName,
+            _ => throw new InvalidOperationException($"Unsupported screen sharing function '{functionName}'.")
+        };
+
+        _logger.LogInformation("Invoking W365 screen sharing action {FunctionName}", functionName);
+        var result = await InvokeToolThrowOnErrorAsync(w365Tools, mcpToolName, [], cancellationToken);
+        var resultText = result?.ToString() ?? string.Empty;
+
+        switch (functionName)
+        {
+            case StartScreenShareFunctionName:
+                if (!TryExtractSeeUrl(resultText, out var seeUrl))
+                {
+                    return "Screen sharing started, but the viewer link was not returned. Please try starting screen sharing again.";
+                }
+
+                session.ScreenShareActive = true;
+                return $"Screen sharing is ready: [Open Cloud PC screen]({seeUrl})\n\nTreat this link as sensitive and share it only with people who should observe this Cloud PC.";
+
+            case StopScreenShareFunctionName:
+                ResetScreenshareState(session);
+                return "Screen sharing stopped. The Cloud PC session is still available for agent automation.";
+
+            case TakeScreenShareControlFunctionName:
+                session.ScreenShareActive = true;
+                session.HumanControlActive = true;
+                session.WarnedAboutHumanControl = false;
+                return "Remote control is enabled. The most recent TakeControl caller wins, and human input can conflict with agent automation.";
+
+            case ReleaseScreenShareControlFunctionName:
+                session.HumanControlActive = false;
+                session.WarnedAboutHumanControl = false;
+                return "Remote control released. Screen sharing remains available for observation until you stop sharing.";
+
+            default:
+                throw new InvalidOperationException($"Unsupported screen sharing function '{functionName}'.");
+        }
+    }
+
+    private static void ResetScreenshareState(ConversationSession session)
+    {
+        session.ScreenShareActive = false;
+        session.HumanControlActive = false;
+        session.WarnedAboutHumanControl = false;
+    }
+
+    private static bool TryExtractSeeUrl(string response, out string seeUrl)
+    {
+        seeUrl = string.Empty;
+        if (string.IsNullOrWhiteSpace(response))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(response);
+            return TryExtractSeeUrl(document.RootElement, out seeUrl);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryExtractSeeUrl(JsonElement element, out string seeUrl)
+    {
+        seeUrl = string.Empty;
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (string.Equals(property.Name, "seeUrl", StringComparison.OrdinalIgnoreCase)
+                        && property.Value.ValueKind == JsonValueKind.String)
+                    {
+                        seeUrl = property.Value.GetString() ?? string.Empty;
+                        return !string.IsNullOrWhiteSpace(seeUrl);
+                    }
+
+                    if (property.Value.ValueKind == JsonValueKind.String)
+                    {
+                        var nestedText = property.Value.GetString();
+                        if (!string.IsNullOrWhiteSpace(nestedText) && TryExtractSeeUrl(nestedText, out seeUrl))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (TryExtractSeeUrl(property.Value, out seeUrl))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    if (TryExtractSeeUrl(item, out seeUrl))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+
+            default:
+                return false;
         }
     }
 
@@ -1291,6 +1519,7 @@ public class ComputerUseOrchestrator
 
         session.W365SessionId = null;
         session.SessionStarted = false;
+        ResetScreenshareState(session);
         logger.LogInformation("Session state cleared; awaiting transparent re-acquisition.");
     }
 
@@ -1519,5 +1748,8 @@ public class ComputerUseOrchestrator
         public int ScreenshotCounter { get; set; }
         public string? ScreenshotSubfolder { get; set; }
         public bool FolderShared { get; set; }
+        public bool ScreenShareActive { get; set; }
+        public bool HumanControlActive { get; set; }
+        public bool WarnedAboutHumanControl { get; set; }
     }
 }

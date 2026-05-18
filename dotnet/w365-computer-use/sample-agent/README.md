@@ -6,6 +6,8 @@ This sample demonstrates how to build an agent that controls a Windows 365 Cloud
 
 The agent receives a natural language task from the user, provisions a W365 desktop session via MCP tools, then runs a CUA (Computer Use Agent) loop: the model sees screenshots, decides actions (click, type, scroll), and the MCP server executes them on the VM.
 
+The sample also demonstrates W365 screen sharing: a user can explicitly ask for a viewer link, open it to observe the Cloud PC, take or release human remote control, and stop sharing without ending the Cloud PC session.
+
 It supports two model types:
 - **`computer-use-preview`** - The original CUA model on Azure OpenAI
 - **`gpt-5.4` / `gpt-5.4-mini`** - Newer GPT models with built-in computer use capability
@@ -124,6 +126,20 @@ dotnet run
 3. Send a message like: *"Open Notepad and type Hello World"*
 4. Screenshots are saved to `./Screenshots/` automatically
 
+### 8. Demo screen sharing
+
+After MCP Platform includes the W365 screenshare tools, try this flow:
+
+1. Send: *"Share the Cloud PC screen so I can watch."*
+2. The agent returns a clickable `Open Cloud PC screen` link.
+3. Open the link in a browser to observe the active Cloud PC.
+4. Send: *"Take control."*
+5. Interact with the Cloud PC manually if needed.
+6. Send: *"Release control."*
+7. Send: *"Stop sharing."*
+
+Treat the viewer link as sensitive. It is returned to the requesting user for the demo, but the sample avoids storing it in model conversation history.
+
 ## Configuration Reference
 
 | Setting | Description | Default |
@@ -158,11 +174,13 @@ The tool type is auto-derived from the model name (`gpt-*` -> `computer`, otherw
 2. **MCP connection** established (direct SSE in dev, A365 SDK gateway in prod)
 3. **Session acquisition** runs transparently on the first W365 tool call — ATG picks an eligible Cloud PC pool, checks out a session, and probes readiness. The session is reused across messages.
 4. **CUA loop** in `ComputerUseOrchestrator.RunAsync`:
-   - User message + conversation history sent to the model
-   - Model returns `computer_call` actions (click, type, scroll, etc.)
-   - Actions translated to MCP tool calls (`click`, `type_text`, `press_keys`, etc. — discovered dynamically from the W365 remote server)
-   - Screenshot captured after each action and fed back to the model
-   - Loop continues until model calls `OnTaskComplete` or max iterations reached
+    - User message + conversation history sent to the model
+    - Model returns `computer_call` actions (click, type, scroll, etc.)
+    - Explicit screenshare requests call synthetic functions that map to W365 MCP tools:
+      `StartScreenShare`, `StopScreenShare`, `TakeScreenShareControl`, and `ReleaseScreenShareControl`
+    - Actions translated to MCP tool calls (`click`, `type_text`, `press_keys`, etc. — discovered dynamically from the W365 remote server)
+    - Screenshot captured after each action and fed back to the model
+    - Loop continues until model calls `OnTaskComplete` or max iterations reached
 5. **Response** sent back to user
 6. **Session persists** across messages for follow-up tasks
 7. **EndSession** called on app shutdown (Ctrl+C) via `mcp_W365ComputerUse_EndSession` to release the VM
@@ -171,6 +189,8 @@ The tool type is auto-derived from the model name (`gpt-*` -> `computer`, otherw
 
 - Sessions are started **once** on the first message and reused across all subsequent messages
 - Conversation history accumulates across messages, giving the model context for follow-up tasks
+- Screen sharing is separate from MCP automation: the human viewer/control channel uses W365 `/screenshare`, while agent automation continues through MCP tools
+- The most recent `TakeControl` caller wins. Human and agent inputs are cooperative and can conflict, so the sample warns before continuing automation while human control is active
 - On app shutdown (`Ctrl+C`), the agent calls `EndSession` to release the VM back to the pool
 - If the app crashes, sessions auto-expire after ~30 minutes on the W365 backend
 
