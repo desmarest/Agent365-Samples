@@ -131,8 +131,8 @@ dotnet run
 After MCP Platform includes the W365 screenshare tools, try this flow:
 
 1. Send: *"Share the Cloud PC screen so I can watch."*
-2. The agent returns a clickable `Open Cloud PC screen` link.
-3. Open the link in a browser to observe the active Cloud PC.
+2. The agent returns a clickable `Open Cloud PC screen` link for browser URLs. If W365 returns a non-browser viewer URI, the sample shows it as copyable text instead of rendering a broken link.
+3. Open the link in a browser, or copy the viewer URI into the registered screen sharing viewer, to observe the active Cloud PC.
 4. Send: *"Take control."*
 5. Interact with the Cloud PC manually if needed.
 6. Send: *"Release control."*

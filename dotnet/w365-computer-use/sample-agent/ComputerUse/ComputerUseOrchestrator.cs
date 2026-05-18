@@ -778,7 +778,7 @@ public class ComputerUseOrchestrator
                 }
 
                 session.ScreenShareActive = true;
-                return $"Screen sharing is ready: [Open Cloud PC screen]({seeUrl})\n\nTreat this link as sensitive and share it only with people who should observe this Cloud PC.";
+                return FormatScreenShareViewerResponse(seeUrl);
 
             case StopScreenShareFunctionName:
                 ResetScreenshareState(session);
@@ -824,6 +824,19 @@ public class ComputerUseOrchestrator
         {
             return false;
         }
+    }
+
+    private static string FormatScreenShareViewerResponse(string seeUrl)
+    {
+        var normalizedSeeUrl = seeUrl.Trim().Replace("\r", string.Empty, StringComparison.Ordinal).Replace("\n", string.Empty, StringComparison.Ordinal);
+        if (Uri.TryCreate(normalizedSeeUrl, UriKind.Absolute, out var uri)
+            && (string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)))
+        {
+            return $"Screen sharing is ready: [Open Cloud PC screen](<{normalizedSeeUrl}>)\n\nIf the link does not open, copy and paste this URL into your browser:\n`{normalizedSeeUrl}`\n\nTreat this link as sensitive and share it only with people who should observe this Cloud PC.";
+        }
+
+        return $"Screen sharing is ready, but the viewer URI is not a browser URL. Copy this URI and open it with the registered screen sharing viewer:\n`{normalizedSeeUrl}`\n\nTreat this URI as sensitive and share it only with people who should observe this Cloud PC.";
     }
 
     private static bool TryExtractSeeUrl(JsonElement element, out string seeUrl)
